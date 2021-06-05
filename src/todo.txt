@@ -1,0 +1,119 @@
+
+// g++ client.cpp -o client -lpthread
+// g++ aserver.h Connection.cpp Locker.cpp Channel.cpp Epoll.cpp EventLoop.cpp Reactor.cpp ThreadEventLoop.cpp ThreadEventLoopPool.cpp -o server -lpthread
+
+g++ *.h *.cpp -o server -lpthread
+
+
+5-20
+问题：
+    1.Connection和Channel内存删除的问题：ThreadPool放一个Connection_Map，在close的时候进行delete。加Mutex
+    2.EventLoop中Channel_Map的互斥问题：加Mutex
+
+指针改成变量的问题：
+    不行，比如Connection里面有个Channel指针，假如最开始的Connection的生命周期结束了，
+    那么就会调用析构函数来释放掉Channel的内存，而在其他地方，Connection仍然工作，但因为Channel指针
+    指向的内存已经被释放了，所以就会出错。
+    So：方案就是：
+        1.要么Connection和Channel都使用指针。
+        2.要么Connection和Channel都使用变量（这样在复制时，Channel也复制多一份），
+            但是，这个会引起频繁的对象构造和析构。
+todo：
+    1.(已解决)阻塞拒绝连接的处理，在add_connection的函数加个bool返回值，在false时，Reactor删除掉该fd。
+        或者直接在ThreadPool的add_connection函数中处理。
+    2.把Reactor也封装成epoll、channel的格式
+    3.把write_handle也写上，写成广播格式
+    4.普通指针改成智能指针。
+
+
+重大发现：
+    之前阻塞队列的实现中，阻塞connection变成工作connection时，会出现segmentation fault的问题。
+    出现问题的地方是epoll_add。加锁之后，问题解决了，估计是epoll的内核区也要互斥访问（修改）才行
+
+
+
+
+
+5-19
+服务器模式就先放下
+明天：
+    1.Channle的各种Handler改成绑定注册的形式
+    2.定时器
+
+定时器：
+    TimerNode
+    TimerManager：每个工作线程都有一个TimerManager。在添加新Channel的时候
+
+
+5-19
+主线程先副线程添加新Channel时，使用eventfd（类似于管道，线程间的通信？）
+所以这个eventfd在主线程中要创建一个list，副线程中的epoll要加入这个eventfd
+这样主线程就不用调用副线程的东西，从而避免了对Channel_Map加锁
+
+此外，该fd还可以用来关闭连接的传递。
+
+每个副线程要开两个eventfd
+
+还要对Channel指针序列化成字符串
+
+
+
+
+05-14
+Reactor两个线程：
+    1.主线程接受新连接Channel，并将其放到请求队列中
+    2.副线程管理请求队列中Channel的分配
+主线程和副线程的公共资源是请求队列，需要用Mutex：
+    主线程：Epoll到新的连接，用Mutex锁住请求队列，然后把Channel加进去，释放Mutex
+    副线程：一直循环：
+        while(true){
+            获取Mutex // 非阻塞获取
+            while 够条件为请求队列里的任务分配到Thread：
+                则分配
+            释放
+        }
+
+
+EventLoop：
+    疑惑：Channel_Map放在Thread中还是放在EventLoop中？
+    Channel_Map也要加互斥锁，因为add的时候，是主线程在操作，读和remove的时候，是EventLoop线程在操作
+
+
+ （以下的划掉）   
+改成：
+    （Acceptor）Reactor主线程专门接受新的连接
+    （Epoller）Reactor专门Epoll检测连接的读写及关闭事件，只检测，不处理。一旦处理到，就封装成一个Channel任务，放到请求队列中
+    （Thread）线程池，里面的线程没有Epoll了，只有一个loop，不断地从请求队列中读取任务
+
+
+
+05-13
+线程池：
+增加：处理量、接纳量、请求队列（长度为最大接纳量-最大处理量）
+（如此一来：请求队列就要加锁了）
+如果线程池还有剩余的处理量，则轮询个线程来处理，否则，放到请求队列中。
+当关闭一个连接时，需要更新当前的处理量。
+还需要搞一个条件变量，当剩余处理量大于等于0，则从请求队列中拿取任务来处理。
+
+所有任务都需要经过请求队列，方便同意处理嘛！
+此时请求队列相当于是消息队列，可以异步处理。主线程接到新的连接，就建个channel扔到请求队列中
+靠着条件变量，当有剩余处理量，就从请求队列中挑任务进行处理。
+
+
+疑问：
+假如已有一个文件描述符
+且已事件产生（比如读事件）
+这时我再用epoll，是否能够检测出来。
+
+经过实验可得：
+可以检测出来，但是只能检测出第一次事件，第二次及之后的事件估计都被丢弃了（而不是覆盖）。等读完这个事件之后，又可以正常读了
+所以是不是事件也有个缓存？在内核里？
+
+还有个疑问就是：
+我接受端没来得及读，发送端却一直写，这会发生什么事情？要怎么处理这种情况？（发送断要判断EPOLLOUT？可写）
+来不及读，估计也是跟上面的一样，后续来的写会被丢弃（经实验证明，确实如此）
+
+
+
+
+
