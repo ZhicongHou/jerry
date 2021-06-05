@@ -6,6 +6,8 @@
 
 Channel::Channel(){
 
+
+
 }
 
 Channel::~Channel(){
